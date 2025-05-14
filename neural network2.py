@@ -1,195 +1,305 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
+from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
+import numpy as np
+import os
+import time
 
-# --- RNN that predicts delta forcing (ΔF) over a sequence ---
-class ForcingRNN(nn.Module):
-    def __init__(self, state_dim=5, control_dim=2, hidden_size=64, num_layers=1):
-        super(ForcingRNN, self).__init__()
-        self.rnn = nn.GRU(input_size=state_dim + control_dim + state_dim,
-                          hidden_size=hidden_size,
-                          num_layers=num_layers,
-                          batch_first=True)
-        self.fc = nn.Linear(hidden_size, control_dim)
+# --- Base Dynamics & Simulation Helpers ---
 
-    def forward(self, V_seq, F0_seq, target_seq):
-        # V_seq: [B, T, state_dim], F0_seq: [B, T, C], target_seq: [B, T, state_dim]
-        inp = torch.cat([V_seq, F0_seq, target_seq], dim=-1)
-        out, _ = self.rnn(inp)
-        delta = self.fc(out)
-        # Delta-prediction + warm-start
-        return F0_seq + delta
-
-# --- Dynamics: include both φ (accel) and ψ (turn) controls ---
 def v_prime_components(v, dt):
-    dt2 = dt * dt / 2
-    x, y, a, s, w = v.unbind(-1)
-    # drift terms (Taylor to second order)
-    A1 = torch.stack([x, y, a, s, w], dim=-1)
-    A2 = torch.stack([s*torch.cos(a), s*torch.sin(a), w, 0, 0], dim=-1)
-    A3 = torch.stack([-s*w*torch.sin(a), s*w*torch.cos(a), 0, 0, 0], dim=-1)
-    A = A1 + dt * A2 + dt2 * A3
-    # control bases
-    B_phi = dt * torch.tensor([0, 0, 0, 1, 0], device=v.device, dtype=v.dtype)
-    B_psi = dt * torch.tensor([0, 0, 0, 0, 1], device=v.device, dtype=v.dtype)
+    """
+    Compute Taylor-series components:
+        v' = A(v, dt) + phi * B_phi(v, dt) + psi * B_psi(v, dt)
+    Returns A, B_phi, B_psi tensors matching the shape of v.
+    """
+    x, y, vx, vy, theta = torch.unbind(v, dim=-1)
+    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+
+    # Drift update (A)
+    A = torch.stack([x + vx * dt,
+                     y + vy * dt,
+                     vx,
+                     vy,
+                     theta], dim=-1)
+
+    # Control basis for forward acceleration
+    B_phi = torch.zeros_like(v)
+    B_phi[..., 2] = cos_t * dt
+    B_phi[..., 3] = sin_t * dt
+
+    # Control basis for angular acceleration
+    B_psi = torch.zeros_like(v)
+    B_psi[..., 4] = dt
+
     return A, B_phi, B_psi
 
-# --- Simulate under a forcing sequence ---
 def simulate(v0, F_seq, ts):
-    V = torch.zeros((len(ts), 5), device=v0.device, dtype=v0.dtype)
-    V[0] = v0
-    for i in range(len(ts) - 1):
+    """Simple discrete integrator using v_prime_components."""
+    batch = v0.dim() > 1
+    if batch:
+        B = v0.shape[0]
+        T = len(ts)
+        V = torch.zeros((B, T, 5), device=v0.device, dtype=v0.dtype)
+        V[:, 0] = v0
+    else:
+        T = len(ts)
+        V = torch.zeros((T, 5), device=v0.device, dtype=v0.dtype)
+        V[0] = v0
+
+    for i in range(T - 1):
         dt = ts[i+1] - ts[i]
-        A, B_phi, B_psi = v_prime_components(V[i], dt)
-        phi, psi = F_seq[i]
-        V[i+1] = A + phi * B_phi + psi * B_psi
+        if batch:
+            A, B_phi, B_psi = v_prime_components(V[:, i], dt)
+            phi = F_seq[:, i, 0]; psi = F_seq[:, i, 1]
+            V[:, i+1] = A + phi.unsqueeze(-1) * B_phi + psi.unsqueeze(-1) * B_psi
+        else:
+            A, B_phi, B_psi = v_prime_components(V[i], dt)
+            phi, psi = F_seq[i]
+            V[i+1] = A + phi * B_phi + psi * B_psi
     return V
 
-# --- Small-Adam polish on forcing sequence ---
-def refine_forcing(v0, F_init, ts, target_seq, n_steps=10, lr=1e-2):
-    F = F_init.clone().detach().requires_grad_(True)
-    optimizer = optim.Adam([F], lr=lr)
-    criterion = nn.MSELoss()
-    for _ in range(n_steps):
-        optimizer.zero_grad()
-        V = simulate(v0, F, ts)
-        loss = criterion(V, target_seq)
-        loss.backward()
-        optimizer.step()
-    return F.detach(), loss.item()
+def consistent_simulation(v0, F_seq, ts):
+    """Alias to simulate for clarity—use this everywhere."""
+    return simulate(v0, F_seq, ts)
 
-# --- Meta-loss: count steps needed to converge under inner Adam ---
-def compute_meta_loss(v0, F_pred, ts, target_seq,
-                      max_steps=20, tol=1e-2, inner_lr=1e-2):
-    F = F_pred.clone().detach().requires_grad_(True)
-    optimizer = optim.Adam([F], lr=inner_lr)
-    criterion = nn.MSELoss()
-    initial_loss = criterion(simulate(v0, F, ts), target_seq).item()
-    steps_needed = max_steps
-    for i in range(max_steps):
-        optimizer.zero_grad()
-        V = simulate(v0, F, ts)
-        loss = criterion(V, target_seq)
-        if loss.item() < tol * initial_loss:
-            steps_needed = i
-            break
-        loss.backward()
-        optimizer.step()
-    final_loss = loss.item()
-    # penalize fraction of max_steps used
-    meta = final_loss + (steps_needed / max_steps)
-    return meta
+def create_valid_trajectory(v0, F_gt, ts, xT, yT, tol=2.0):
+    """
+    Simulate and check if final (x,y) is within tol of target.
+    Returns a bool mask and the full trajectory tensor.
+    """
+    sim_traj = consistent_simulation(v0, F_gt, ts)
+    if sim_traj.dim() == 3:
+        endpoint = sim_traj[:, -1, :2]
+        target = torch.tensor([xT, yT], device=v0.device).unsqueeze(0)
+        error = torch.norm(endpoint - target, dim=1)
+        valid = error < tol
+    else:
+        endpoint = sim_traj[-1, :2]
+        target = torch.tensor([xT, yT], device=v0.device)
+        valid = torch.norm(endpoint - target) < tol
+    return valid, sim_traj
 
-# --- Training loop with primary + meta loss ---
-def train_rnn_with_meta_loss(model, data_loader, ts, epochs=50,
-                             lr=1e-3, lambda_meta=0.1, device='cpu'):
-    model.to(device)
-    opt = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-    for ep in range(epochs):
-        total_loss = 0.0
-        for v0_batch, F_gt_batch, target_seq_batch in data_loader:
-            # Ensure float32
-            v0_batch = v0_batch.float().to(device)           # [B,5]
-            F_gt_batch = F_gt_batch.to(device)              # [B,T,2]
-            target_seq_batch = target_seq_batch.to(device)  # [B,T,5]
+# --- Visualization ---
 
-            B = v0_batch.size(0)
-            T = ts.size(0)
-            # Prepare input V_seq: tile initial state across time
-            V_seq = v0_batch.unsqueeze(1).repeat(1, T, 1)   # [B,T,5]
-            # Warm start forcing
-            F0 = torch.zeros_like(F_gt_batch)
-
-            # RNN prediction
-            F_pred = model(V_seq, F0, target_seq_batch)
-
-            # Primary loss on ΔF match
-            loss_main = criterion(F_pred, F_gt_batch)
-            # Meta loss on polish difficulty (first sample only for speed)
-            meta = compute_meta_loss(v0_batch[0], F_pred[0], ts, target_seq_batch[0])
-            loss = loss_main + lambda_meta * meta
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(data_loader)
-        print(f"Epoch {ep+1}/{epochs} avg_loss={avg_loss:.4f}")
-
-# --- Plotting utility ---
-def showTraj(V, ax, label=None, **kwargs):
-    x = V[:,0].cpu().numpy()
-    y = V[:,1].cpu().numpy()
-    ax.plot(x, y, label=label, **kwargs)
-    if label:
-        ax.legend()
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    ax.set_aspect('equal', 'box')
-
-# --- Example main script ---
-def main():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    T = 50
-    ts = torch.linspace(0, 5, T, dtype=torch.float32, device=device)
-
-    # Dummy dataset: random start/end positions
-    class DummyDataset(torch.utils.data.Dataset):
-        def __init__(self, N):
-            self.data = []
-            for _ in range(N):
-                x0, y0 = np.random.uniform(-5,5,2)
-                xT, yT = np.random.uniform(-5,5,2)
-                # Ensure float32 construction
-                v0 = torch.tensor([x0, y0, 0.0, 0.0, 0.0], dtype=torch.float32, device=device)
-                # ground truth: straight-line forcing
-                dt_total = ts[-1].item()
-                F_phi = (xT - x0) / dt_total
-                F_psi = (yT - y0) / dt_total
-                F_gt = torch.stack([
-                    torch.full((T,), F_phi, dtype=torch.float32, device=device),
-                    torch.full((T,), F_psi, dtype=torch.float32, device=device)
-                ], dim=-1)
-                # target_seq: replicate end state for all t for simplicity
-                target_seq = torch.zeros((T,5), dtype=torch.float32, device=device)
-                target_seq[-1,0] = xT
-                target_seq[-1,1] = yT
-                self.data.append((v0, F_gt, target_seq))
-        def __len__(self): return len(self.data)
-        def __getitem__(self, idx): return self.data[idx]
-
-    dataset = DummyDataset(100)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
-
-    # Build and train
-    model = ForcingRNN()
-    train_rnn_with_meta_loss(model, loader, ts, epochs=20, device=device)
-
-    # Pick one sample for visualization
-    v0, F_gt, target_seq = dataset[0]
-    # Prepare V_seq for single sample
-    V_seq_single = v0.unsqueeze(0).unsqueeze(1).repeat(1, T, 1)  # [1,T,5]
-    F0_single = torch.zeros_like(F_gt, dtype=torch.float32).unsqueeze(0)             # [1,T,2]
-    target_single = target_seq.unsqueeze(0)                     # [1,T,5]
-    F_rnn = model(V_seq_single, F0_single, target_single).squeeze(0)
-    F_refined, _ = refine_forcing(v0, F_rnn, ts, target_seq)
-
-    # Simulate trajectories
-    V_gt = simulate(v0, F_gt, ts)
-    V_rnn = simulate(v0, F_rnn, ts)
-    V_ref = simulate(v0, F_refined, ts)
-
-    # Plot
-    fig, ax = plt.subplots()
-    showTraj(V_gt,  ax, label='Ground Truth',    linestyle='-')
-    showTraj(V_rnn, ax, label='RNN Warm Start',   linestyle='--')
-    showTraj(V_ref, ax, label='RNN + Adam Refine', linestyle='-.')
-    ax.scatter(V_gt[0,0], V_gt[0,1], marker='o', s=50)
-    ax.scatter(V_gt[-1,0],V_gt[-1,1],marker='X', s=50)
+def visualize_trajectories(examples, xT, yT, tol, num_to_plot=5, save_path="trajectories.png"):
+    """
+    Plot (x, y) trajectories, start, target, and tolerance region.
+    """
+    plt.figure(figsize=(8, 8))
+    
+    # Plot a subset of trajectories
+    num_to_plot = min(num_to_plot, len(examples))
+    for i in range(num_to_plot):
+        v0, F_gt, ts, _ = examples[i]
+        traj = consistent_simulation(v0, F_gt, ts)
+        traj_np = traj.detach().cpu().numpy()
+        plt.plot(traj_np[:, 0], traj_np[:, 1], 'b-', alpha=0.5, label='Trajectories' if i == 0 else None)
+        plt.plot(traj_np[-1, 0], traj_np[-1, 1], 'bo', label='Endpoints' if i == 0 else None)
+    
+    # Plot start and target
+    plt.plot(0, 0, 'go', label='Start (0, 0)')
+    plt.plot(xT, yT, 'r*', label=f'Target ({xT}, {yT})')
+    
+    # Plot tolerance circle
+    circle = plt.Circle((xT, yT), tol, color='r', fill=False, linestyle='--', label='Tolerance')
+    plt.gca().add_patch(circle)
+    
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title('Simulated Ground-Truth Trajectories')
+    plt.legend()
+    plt.grid(True)
+    plt.axis('equal')
+    plt.savefig(save_path)
     plt.show()
+    print(f"Ground-truth trajectory plot saved to {save_path}")
 
-if __name__ == "__main__":
-    main()
+def visualize_rnn_vs_gt(model, example, xT, yT, tol, device, save_path="rnn_vs_gt_trajectories.png"):
+    """
+    Plot ground-truth vs. RNN-predicted trajectory for a single example.
+    """
+    model.eval()
+    with torch.no_grad():
+        v0, F_gt, ts, _ = example
+        v0 = v0.to(device)
+        F_gt = F_gt.to(device)
+        ts = ts.to(device)
+
+        # Ground-truth trajectory
+        gt_traj = consistent_simulation(v0, F_gt, ts)
+        gt_traj_np = gt_traj.detach().cpu().numpy()
+
+        # RNN-predicted trajectory
+        T = F_gt.shape[0]
+        D = v0.shape[-1]
+        dummy_states = torch.zeros((1, T, D), device=device)
+        dummy_controls = torch.zeros_like(F_gt).unsqueeze(0)
+        F_init, _ = model(dummy_states, dummy_controls)
+        F_init = F_init.squeeze(0)  # Remove batch dimension
+        rnn_traj = consistent_simulation(v0, F_init, ts)
+        rnn_traj_np = rnn_traj.detach().cpu().numpy()
+
+        # Plot
+        plt.figure(figsize=(8, 8))
+        plt.plot(gt_traj_np[:, 0], gt_traj_np[:, 1], 'b-', label='Ground-Truth Trajectory')
+        plt.plot(gt_traj_np[-1, 0], gt_traj_np[-1, 1], 'bo', label='Ground-Truth Endpoint')
+        plt.plot(rnn_traj_np[:, 0], rnn_traj_np[:, 1], 'r--', label='RNN-Predicted Trajectory')
+        plt.plot(rnn_traj_np[-1, 0], rnn_traj_np[-1, 1], 'ro', label='RNN-Predicted Endpoint')
+        plt.plot(0, 0, 'go', label='Start (0, 0)')
+        plt.plot(xT, yT, 'r*', label=f'Target ({xT}, {yT})')
+        circle = plt.Circle((xT, yT), tol, color='r', fill=False, linestyle='--', label='Tolerance')
+        plt.gca().add_patch(circle)
+        
+        plt.xlabel('X')
+        plt.ylabel('Y')
+        plt.title('Ground-Truth vs. RNN-Predicted Trajectory')
+        plt.legend()
+        plt.grid(True)
+        plt.axis('equal')
+        plt.savefig(save_path)
+        plt.show()
+        print(f"RNN vs. Ground-Truth plot saved to {save_path}")
+
+# --- Model & Dataset ---
+
+class TrajectoryRNN(nn.Module):
+    def __init__(self, state_dim=5, control_dim=2, hidden_dim=128, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.rnn = nn.GRU(state_dim + control_dim,
+                          hidden_dim,
+                          num_layers,
+                          batch_first=True,
+                          dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, control_dim)
+
+    def forward(self, states, controls, hidden=None):
+        x = torch.cat([states, controls], dim=-1)
+        out, hidden = self.rnn(x, hidden)
+        return self.fc(out), hidden
+
+class TrajectoryDataset(Dataset):
+    def __init__(self, examples):
+        self.examples = examples
+    def __len__(self):
+        return len(self.examples)
+    def __getitem__(self, idx):
+        v0, F_gt, ts, target = self.examples[idx]
+        return v0, F_gt, ts, target
+
+# --- Training Loop ---
+
+def train_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    total_mae = 0.0
+    total_time = 0.0
+    num_batches = 0
+
+    for v0, F_gt, ts, (xT, yT) in loader:
+        # Move data
+        v0 = v0.to(device)
+        F_gt = F_gt.to(device)
+        ts = ts.to(device)
+
+        # Extract shapes
+        B = v0.shape[0] if v0.dim() > 1 else 1
+        T = F_gt.shape[1] if F_gt.dim() > 1 else F_gt.shape[0]
+        D = v0.shape[-1]
+
+        # Warm-start zeros
+        dummy_states = torch.zeros((B, T, D), device=device)
+        dummy_controls = torch.zeros_like(F_gt)
+
+        optimizer.zero_grad()
+        # Measure prediction time
+        start_time = time.perf_counter()
+        F_init, _ = model(dummy_states, dummy_controls)
+        end_time = time.perf_counter()
+        pred_time = end_time - start_time
+
+        deltaF = F_gt - F_init
+        loss = deltaF.abs().mean()  # MAE as loss
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_mae += deltaF.abs().mean().item()  # Redundant with loss, kept for clarity
+        total_time += pred_time
+        num_batches += 1
+
+    avg_loss = total_loss / num_batches
+    avg_mae = total_mae / num_batches
+    avg_time = total_time / num_batches
+    return avg_loss, avg_mae, avg_time
+
+# --- Main Script ---
+
+if __name__ == '__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = TrajectoryRNN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    model_path = "trajectory_rnn.pth"
+
+    # Load existing model if available
+    if os.path.exists(model_path):
+        try:
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print(f"Loaded existing model from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {e}. Starting with a fresh model.")
+    else:
+        print("No existing model found. Starting with a fresh model.")
+
+    # Generate and filter dummy examples
+    examples = []
+    num_examples = 1000
+    ts = torch.linspace(0, 10, steps=50)
+    T = len(ts)
+    xT, yT = 5.0, 5.0
+    tol = 2.0
+
+    for _ in range(num_examples):
+        # Initial state: start at origin with zero velocity and orientation
+        v0 = torch.zeros(5)  # [x=0, y=0, vx=0, vy=0, theta=0]
+
+        # Generate control inputs to approximately reach (xT, yT)
+        distance = torch.sqrt(torch.tensor(xT**2 + yT**2))
+        total_time = ts[-1]
+        phi = (2 * distance / total_time**2)  # Approximate constant acceleration
+        psi = 0.0  # No rotation needed for straight-line motion
+        F_gt = torch.zeros((T, 2))
+        F_gt[:, 0] = phi  # Forward acceleration
+        F_gt[:, 1] = psi  # Angular acceleration
+
+        # Adjust theta in v0 to point toward target
+        theta = torch.atan2(torch.tensor(yT), torch.tensor(xT))
+        v0[4] = theta  # Set initial orientation
+
+        # Simulate and check validity
+        valid, traj = create_valid_trajectory(v0, F_gt, ts, xT, yT, tol=tol)
+        if valid:
+            examples.append((v0, F_gt, ts, (xT, yT)))
+
+    if len(examples) == 0:
+        raise ValueError("No valid trajectories generated. Check control inputs or tolerance.")
+
+    print(f"Generated {len(examples)} valid trajectories.")
+    
+    # Visualize ground-truth trajectories before training
+    visualize_trajectories(examples, xT, yT, tol, num_to_plot=5, save_path="trajectories.png")
+
+    loader = DataLoader(TrajectoryDataset(examples), batch_size=32, shuffle=True)
+    for epoch in range(10):
+        avg_loss, avg_mae, avg_time = train_epoch(model, loader, optimizer, device)
+        print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f} | MAE: {avg_mae:.4f} | Avg Prediction Time: {avg_time*1000:.2f} ms")
+
+    # Save the trained model
+    torch.save(model.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
+
+    # Visualize RNN vs. ground-truth trajectory for the first example
+    if examples:
+        visualize_rnn_vs_gt(model, examples[0], xT, yT, tol, device, save_path="rnn_vs_gt_trajectories.png")
